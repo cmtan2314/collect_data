@@ -1,0 +1,51 @@
+# Every top-level key is a state, except "Task" which lists the task sequences.
+#
+# A state declares enter / progress / exit + id.
+#   "default"  -> the default callback of that field (default_enter, default_exit,
+#                 default_progress), all of them empty
+#   <any name> -> a callback from custom_callbacks.py, e.g. custom_A. Names are
+#                 resolved in CALLBACK_MAP AT RUNTIME, so registering a callback
+#                 after startup still works.
+#
+# Task: each task is one chain, Start and End are added automatically:
+#           Start -> [sequence] -> End -> Start
+#       A state may appear only once per sequence. Start / End / Cancel must be
+#       declared as states but must not be listed in a sequence.
+Start:
+  enter: start_enter
+  progress: start_progress
+  exit: start_exit
+  id: 1
+End:
+  enter: end_enter
+  progress: end_progress
+  exit : end_exit
+  id : 0
+Cancel:
+  enter: cancel_enter
+  progress: cancel_progress
+  exit: cancel_exit
+  id: -1
+Pick:
+  enter: default
+  progress: default
+  exit: default
+  id: 2
+Place:
+  enter: default
+  progress: default
+  exit: cus_cut_ros_bag
+  id: 3
+Drop :
+  enter: default
+  progress: default
+  exit : default
+  id: 4
+
+Task :
+  Normal :
+    sequence : [Pick , Place ]
+  Normal2 :
+    sequence : [Place, Pick , Drop ]
+  
+
