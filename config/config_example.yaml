@@ -44,7 +44,7 @@ Drop :
 
 Task :
   Normal :
-    sequence : [Pick , Place  , Drop]
+    sequence : [Pick , Place  ]
   Normal2 :
     sequence : [Place, Pick , Drop ]
   Normal3 :
