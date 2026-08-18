@@ -25,6 +25,8 @@ Events: progress() never switches state itself, it returns an event for tick()
     Event.NONE   -> stay, run progress again next tick
 """
 
+import fcntl
+import os
 import threading
 import time
 from pathlib import Path
@@ -33,11 +35,14 @@ import yaml
 from statemachine import State, StateMachine
 from statemachine.factory import StateMachineMetaclass
 
+import bag
 import custom_callbacks
+import protocol
 from callbacks import (DEFAULT_ENTER, DEFAULT_EXIT, DEFAULT_PROGRESS,
                        has_callback, resolve_callback)
 from events import (SHUTDOWN, CancelRequest, Event, NextRequest, Request, ask)
-from server import Server
+from protocol import Command
+from server import MqttServer
 
 CONFIG_PATH = Path(__file__).parent / "config" / "config_example.yaml"
 
@@ -49,8 +54,13 @@ FIXED_STATES = (START_STATE, END_STATE, CANCEL_STATE)
 EVENT_NEXT = "next"
 EVENT_CANCEL = "cancel"
 
-KEY_TASK = "Task"  # reserved top-level key, every other top-level key is a state
+# reserved top-level keys. Every OTHER top-level key is a state.
+KEY_TASK = "Task"
+KEY_BAG = "Ros2_bag"  # nothing to do with the machine, see read_bag_config()
+RESERVED_KEYS = (KEY_TASK, KEY_BAG)
 KEY_SEQUENCE = "sequence"
+KEY_BAG_TOPICS = "Topic"
+KEY_BAG_PATH = "path"
 KEY_ENTER = "enter"
 KEY_PROGRESS = "progress"
 KEY_EXIT = "exit"
@@ -130,7 +140,9 @@ def load_config(path=CONFIG_PATH):
     if not raw:
         raise ValueError(f"{path}: empty config")
 
-    raw_tasks = raw.pop(KEY_TASK, None)  # pop, so everything left is a state
+    raw_tasks = raw.pop(KEY_TASK, None)
+    for reserved in RESERVED_KEYS:
+        raw.pop(reserved, None)  # so that everything left over is a state
     if not isinstance(raw_tasks, dict) or not raw_tasks:
         raise ValueError(f"{path}: missing '{KEY_TASK}:' section, or no task in it")
 
@@ -142,6 +154,22 @@ def load_config(path=CONFIG_PATH):
     tasks = {name: _read_task(path, name, spec, states)
              for name, spec in raw_tasks.items()}
     return states, tasks
+
+
+def read_bag_config(path=CONFIG_PATH):
+    """The 'Ros2_bag:' section -> (topics, root). Empty topics means no recording.
+
+    Read on its own rather than through load_config(), which drops the key: the
+    ROS topics have nothing to do with building a machine, they only share the
+    file because one file is easier to hand around than two.
+    """
+    raw = yaml.safe_load(path.read_text()) or {}
+    section = raw.get(KEY_BAG) or {}
+
+    topics = section.get(KEY_BAG_TOPICS) or []
+    if not isinstance(topics, list):
+        topics = [topics]
+    return topics, section.get(KEY_BAG_PATH) or bag.DEFAULT_ROOT
 
 
 def _read_state(path, name, spec):
@@ -254,12 +282,49 @@ class ConfiguredSMBase(StateMachine):
         return self.contexts[self.current_state_value]
 
     def on_enter_state(self, state):
+        context = self.contexts[state.id]
+        error = self._bag_on_enter(context)
         if self.listener is not None:
-            self.listener(state.id)
-        self.contexts[state.id].enter()
+            self.listener(context, self.task, error)
+        context.enter()
 
     def on_exit_state(self, state):
-        self.contexts[state.id].exit()
+        context = self.contexts[state.id]
+        if context.name == START_STATE:
+            bag.RECORDER.resume()  # the waiting is over, start writing for real
+        context.exit()
+
+    def _bag_on_enter(self, context):
+        """Drive the recorder off the chain. Returns error text, None if fine.
+
+        One recorder covers the whole lap; each state only asks it to cut the
+        file, and hands over its own id so the chunk can be named after it. Start
+        holds it paused because a bag of the robot standing still waiting for an
+        operator is bytes nobody will ever look at.
+        """
+        name = context.name
+        match name:
+            case _ if name == START_STATE:
+                bag.RECORDER.reset()  # the previous lap finished, its bags stay
+                try:
+                    # comes up paused, resumed on exit; the task names the folder
+                    bag.RECORDER.start_lap(self.task)
+                except bag.BagError as error:
+                    print(f"[warn    ] {error}")
+                    bag.RECORDER.last_error = str(error)
+                    return str(error)  # red on Start, nothing to cancel yet
+            case _ if name == CANCEL_STATE:
+                bag.RECORDER.stop_lap()
+                bag.RECORDER.discard()  # the lap is void, so is everything it wrote
+            case _ if name == END_STATE:
+                bag.RECORDER.stop_lap()
+            case _:
+                if bag.RECORDER.enabled and not bag.RECORDER.recording:
+                    # never started, or died earlier: say so on every state rather
+                    # than let a whole lap run and quietly record nothing
+                    return bag.RECORDER.last_error or "not recording"
+                bag.RECORDER.split_for(name, context.id)
+        return None
 
     def tick(self):
         """One loop: run progress of the current state, move on the event it returns."""
@@ -305,16 +370,52 @@ def chain_of(contexts, task):
 
 
 # ====================================================================== run
-# Three loops, none of them talks to another directly. They only meet through the
-# one-shot flags in events.py and through SHUTDOWN:
+# Three threads, none of them talks to another directly. They only meet through
+# the one-shot flags in events.py and through SHUTDOWN:
 #
 #   machine thread   ticks the state machine every TICK_PERIOD
-#   server thread    accepts GUI clients on PORT, turns lines into requests
+#   mqtt thread      paho's own, turns incoming messages into requests
 #   main thread      reads the terminal (blocking, which is why it is not a thread)
 TICK_PERIOD = 0.2    # seconds between two ticks
 ABORT_DELAY = 10.0   # seconds without any client before the lap is cancelled
 DEFAULT_TASK = "Normal2"
 TERMINAL_HELP = "Enter = next, 'c' + Enter = cancel, 'q' + Enter = quit"
+
+# XDG_RUNTIME_DIR is on tmpfs and wiped on logout, so nothing survives a reboot
+LOCK_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "state_machine.lock"
+_lock_file = None  # module level on purpose: closing it would release the lock
+
+
+def claim_single_run(path=LOCK_PATH):
+    """Refuse to start while another copy is running. True if we may go ahead.
+
+    A TCP server used to get this for free: the second copy failed to bind the
+    port. MQTT gives nothing back, a second copy connects to the broker happily,
+    subscribes to the same command topic, and from then on every button press is
+    carried out twice by two machines that disagree about where the robot is.
+
+    flock is held by the process, so the kernel drops it whatever happens, even
+    on kill -9. There is no stale lock to clean up.
+    """
+    global _lock_file
+
+    lock_file = open(path, "a+")  # append: do not wipe the holder's pid
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.seek(0)
+        holder = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        print(f"[warn    ] another copy is running (pid {holder}, lock {path})")
+        print("[warn    ] two of them would both answer every command, quitting")
+        return False
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(f"{os.getpid()}\n")
+    lock_file.flush()
+    _lock_file = lock_file
+    return True
 
 
 class Runner:
@@ -325,8 +426,8 @@ class Runner:
     a task is one chain, there is no such thing as switching task mid-chain.
     """
 
-    def __init__(self, listener=None):
-        self.listener = listener
+    def __init__(self, publish_state=None):
+        self.publish_state = publish_state  # (payload: dict) -> None
         self.task = None
         self._machine = None
         self._lock = threading.Lock()
@@ -342,9 +443,23 @@ class Runner:
         machine = self.machine
         return "-" if machine is None else machine.current_state_value
 
+    def _announce(self, context, task, error=None):
+        """Listener of the live machine: turn a state change into a state message.
+
+        `error` rides along in info so a GUI can paint the state that failed,
+        rather than having to guess from a lap that cancelled itself.
+        """
+        if self.publish_state is None:
+            return
+
+        info = {"id": context.id}
+        if error:
+            info["error"] = error
+        self.publish_state(protocol.state_message(context.name, task, info=info))
+
     def load(self, task):
         """Build the machine for `task` and make it the live one."""
-        machine = create_machine(task, listener=self.listener)
+        machine = create_machine(task, listener=self._announce)
         with self._lock:
             self._machine = machine
             self.task = task
@@ -397,8 +512,19 @@ class Runner:
             machine = self.machine
             if machine is not None:
                 machine.tick()
+                self._watch_recorder(machine)
             time.sleep(TICK_PERIOD)
         print("[machine ] stopped")
+
+    def _watch_recorder(self, machine):
+        """A disk filling up kills the recorder mid-state, not at the next start."""
+        trouble = bag.RECORDER.trouble()
+        if trouble is None:
+            return
+
+        print(f"[warn    ] {trouble}")
+        self._announce(machine.context, self.task, error=trouble)
+        CancelRequest.set(source="bag")
 
 
 def run_terminal():
@@ -417,64 +543,92 @@ def run_terminal():
 
 
 def make_command_handler(runner):
-    """Build the callback the server hands every incoming line to.
+    """Build the callback the server hands every incoming command to.
 
-    Runs in a client thread, so it never touches a machine directly: it raises the
+    Runs in paho's thread, so it never touches a machine directly: it raises the
     request flags, reads the state name (a plain string), or asks the runner to
-    load another task.
+    load another task. Takes and returns a payload dict, see protocol.py.
     """
-    def handle_command(command):
-        head, _, argument = command.strip().partition(" ")
-        match head.upper():
-            case "NEXT":
-                NextRequest.set(source="tcp")
-                return "OK NEXT"
-            case "CANCEL":
-                CancelRequest.set(source="tcp")
-                return "OK CANCEL"
-            case "STATUS":
-                return f"STATE {runner.state}"
-            case "TASK":
-                return _load_task(runner, argument.strip())
+    def handle_command(payload):
+        request_id = payload.get("id")
+        command = str(payload.get("cmd", "")).lower()
+
+        match command:
+            case Command.NEXT:
+                NextRequest.set(source="mqtt")
+            case Command.CANCEL:
+                CancelRequest.set(source="mqtt")
+            case Command.STATUS:
+                pass  # the answer below already carries state and task
+            case Command.TASK:
+                return _load_task(runner, request_id, payload.get("task"))
             case _:
-                return f"ERR unknown command '{command}'"
+                return protocol.failed(request_id, command,
+                                       f"unknown command '{command}'",
+                                       state=runner.state, task=runner.task)
+
+        return protocol.ok(request_id, command, state=runner.state, task=runner.task)
 
     return handle_command
 
 
-def _load_task(runner, task):
-    """TASK <name>: rebuild the machine from the config on disk.
+def _load_task(runner, request_id, task):
+    """cmd "task": rebuild the machine from the config on disk.
+
+    Only from Start. A lap that has begun is holding the robot somewhere, and
+    swapping the chain under it would leave that half-done work with nobody to
+    finish it. Anywhere else the request is refused and says so, so the operator
+    can end the lap or cancel it first.
 
     The GUI reads the same config to fill its task list, but it only sends the
     NAME: the config that counts is the one next to this file, on the machine that
     drives the robot.
     """
     if not task:
-        return "ERR TASK needs a name"
+        return protocol.failed(request_id, Command.TASK, "no task name given",
+                               state=runner.state, task=runner.task)
+
+    if runner.machine is not None and runner.state != START_STATE:
+        return protocol.failed(
+            request_id, Command.TASK,
+            f"a lap is running, cannot switch task from '{runner.state}'. "
+            f"cancel it or let it reach {START_STATE} first",
+            state=runner.state, task=runner.task)
     try:
         runner.load(task)
     except (OSError, ValueError, KeyError) as error:
         print(f"[warn    ] cannot load task '{task}': {error}")
-        return f"ERR {error}"
-    return f"OK TASK {task}"
+        return protocol.failed(request_id, Command.TASK, error,
+                               state=runner.state, task=runner.task)
+    return protocol.ok(request_id, Command.TASK, state=runner.state, task=runner.task)
 
 
 def main(task=DEFAULT_TASK):
     custom_callbacks.register_all()
+    bag.configure(*read_bag_config())
 
     # the two know each other, so the handler is wired in after the runner exists
-    server = Server()
-    runner = Runner(listener=server.broadcast_state)
+    server = MqttServer()
+    runner = Runner(publish_state=server.publish_state)
     server.handle_command = make_command_handler(runner)
     server.on_clients_changed = runner.on_clients_changed
-    runner.load(task)  # a task to start with; the GUI can push another one
 
-    threading.Thread(target=server.serve_forever, name="server", daemon=True).start()
+    server.start()  # paho spawns its own thread; carries on without a broker
+    runner.load(task)  # a task to start with, the GUI can push another one
     threading.Thread(target=runner.run, name="machine", daemon=True).start()
-    run_terminal()
+
+    try:
+        run_terminal()
+    finally:
+        SHUTDOWN.set()  # stop the tick thread before taking the recorder away
+        bag.shutdown()
+        server.stop()
 
 
 if __name__ == "__main__":
+    if not claim_single_run():
+        raise SystemExit(1)
+
     try:
         main()
     except KeyboardInterrupt:

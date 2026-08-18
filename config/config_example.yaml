@@ -34,7 +34,7 @@ Pick:
 Place:
   enter: default
   progress: default
-  exit: cus_cut_ros_bag
+  exit: default
   id: 3
 Drop :
   enter: default
@@ -44,8 +44,15 @@ Drop :
 
 Task :
   Normal :
-    sequence : [Pick , Place ]
+    sequence : [Pick , Place  , Drop]
   Normal2 :
     sequence : [Place, Pick , Drop ]
-  
+  Normal3 :
+    sequence : [Drop , Pick ]
+Ros2_bag :
+  Topic : [/config ,
+    /joinstate2 , 
+    /join_states,
+    /j]
+  path : ~/data/real
 
