@@ -49,10 +49,22 @@ Task :
     sequence : [Place, Pick , Drop ]
   Normal3 :
     sequence : [Drop , Pick ]
-Ros2_bag :
-  Topic : [/config ,
-    /joinstate2 , 
-    /join_states,
-    /j]
-  path : ~/data/real
 
+Ros2_bag :
+  Topic : [/cam_head/cam_head/color/image_raw ,
+    /cam_left/cam_left/color/image_raw ,
+    /cam_right/cam_right/color/image_raw ,
+    /left_joint_trajectory_controller/controller_state ,
+    /left_joint_trajectory_controller/joint_trajectory ,
+    /left_revo2_hand_controller/controller_state ,
+    /left_revo2_hand_controller/joint_trajectory ,
+    /right_joint_trajectory_controller/controller_state ,
+    /right_joint_trajectory_controller/joint_trajectory ,
+    /right_revo2_hand_controller/controller_state ,
+    /right_revo2_hand_controller/joint_trajectory ,
+    /tf ,
+    /tf_static ,
+    /vr_buttons ,
+    /left_ee_pose ,
+    /right_ee_pose]
+  path : ~/data/real
