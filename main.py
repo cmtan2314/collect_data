@@ -534,6 +534,13 @@ class Runner:
 
     def _watch_recorder(self, machine):
         """A disk filling up kills the recorder mid-state, not at the next start."""
+        warning = bag.RECORDER.space_warning()
+        if warning is not None:
+            # red on the client, but NOT a cancel: cancel deletes the lap, which
+            # is the opposite of what anyone wants with the disk about to fill
+            print(f"[warn    ] {warning}")
+            self._announce(machine.context, self.task, error=warning)
+
         trouble = bag.RECORDER.trouble()
         if trouble is None:
             return
