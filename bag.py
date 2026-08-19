@@ -49,7 +49,6 @@ Cancel has to be able to delete those too.
 import json
 import re
 import shutil
-import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +86,7 @@ MAX_CACHE_BYTES = 20 * 1024 * 1024 * 1024
 # dies of a full disk the bag it was writing is already unusable.
 MIN_FREE_BYTES = 10 * 1024 * 1024 * 1024
 SPACE_CHECK_PERIOD = 5.0  # seconds between disk checks while recording
+TOPIC_CHECK_PERIOD = 1.0  # seconds between graph checks while waiting at Start
 
 # Seconds of real recording at the start of a lap, before it is paused to wait
 # for the operator. A transient_local ("latched") topic - /tf_static, and every
@@ -229,8 +229,9 @@ class BagRecorder:
         self._ros = _Ros()
         self._next_space_check = 0.0
         self._space_warned = False
-        self._holding = False    # in the Start state, waiting for the operator
-        self._latch_timer = None
+        self._latch_deadline = None  # when to go quiet, see LATCH_WINDOW
+        self._topic_next_check = 0.0
+        self._topic_last = None      # last missing list reported by watch_topics
 
     def configure(self, topics, root):
         self.topics = [str(topic).strip() for topic in (topics or [])]
@@ -317,17 +318,19 @@ class BagRecorder:
         self._space_warned = False
         print(f"[bag     ] lap {name} <- {len(self.topics)} topic(s)")
 
-        self._holding = True
-        self._latch_timer = threading.Timer(LATCH_WINDOW, self._quiet_down)
-        self._latch_timer.daemon = True
-        self._latch_timer.start()
+        self._latch_deadline = time.monotonic() + LATCH_WINDOW
 
         self._ros.bind(node_name)
         return name
 
-    def _quiet_down(self):
-        """Pause once the latched messages are in, if Start is still waiting."""
-        if self._holding and self.recording:
+    def tick(self):
+        """Go quiet once the latched messages are in. Called from the machine's
+        own tick, so this costs no thread of its own: the deadline is just a
+        number that a loop already running looks at."""
+        if self._latch_deadline is None or time.monotonic() < self._latch_deadline:
+            return
+        self._latch_deadline = None
+        if self.recording:
             self._recorder.pause()
             print(f"[bag     ] {self._name}: latched topics kept, paused at Start")
 
@@ -400,11 +403,8 @@ class BagRecorder:
     def resume(self):
         """Start is over. Whatever the latch timer was going to do, it is too late
         to be useful and would pause a lap that is now running."""
-        self._holding = False
-        if self._latch_timer is not None:
-            self._latch_timer.cancel()
-            self._latch_timer = None
-        if self.recording:
+        self._latch_deadline = None  # too late to be useful, and it would pause
+        if self.recording:            # a lap that is now running
             self._recorder.resume()
 
     def stop_lap(self):
@@ -420,10 +420,7 @@ class BagRecorder:
 
         recorder, name = self._recorder, self._name
         self._recorder = self._name = None
-        self._holding = False
-        if self._latch_timer is not None:
-            self._latch_timer.cancel()
-            self._latch_timer = None
+        self._latch_deadline = None
         try:
             recorder.stop()
         except Exception as error:
@@ -448,6 +445,27 @@ class BagRecorder:
         self._recorder = self._name = None
         self.last_error = f"recording {name} left nothing on disk"
         return self.last_error
+
+    def watch_topics(self):
+        """The missing topics, but only when that list has CHANGED.
+
+        None means nothing new to say, so the caller can announce a change rather
+        than repeat itself five times a second. An empty list is news too: it is
+        how the client learns the wait is over and the red can come off.
+        """
+        if not self.enabled:
+            return None
+
+        now = time.monotonic()
+        if now < self._topic_next_check:
+            return None
+        self._topic_next_check = now + TOPIC_CHECK_PERIOD
+
+        missing = self.missing_topics()
+        if missing == self._topic_last:
+            return None
+        self._topic_last = missing
+        return missing
 
     def space_warning(self):
         """Said once, when a running lap drops under the free space floor.

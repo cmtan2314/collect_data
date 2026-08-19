@@ -534,6 +534,18 @@ class Runner:
 
     def _watch_recorder(self, machine):
         """A disk filling up kills the recorder mid-state, not at the next start."""
+        bag.RECORDER.tick()  # pauses the lap once Start has held long enough
+
+        missing = bag.RECORDER.watch_topics()
+        if missing is not None:
+            if missing:
+                text = f"waiting for a publisher on {', '.join(missing)}"
+                print(f"[warn    ] {text}")
+                self._announce(machine.context, self.task, error=text)
+            else:
+                print("[bag     ] every topic has a publisher")
+                self._announce(machine.context, self.task)  # clears the red
+
         warning = bag.RECORDER.space_warning()
         if warning is not None:
             # red on the client, but NOT a cancel: cancel deletes the lap, which

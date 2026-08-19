@@ -19,6 +19,7 @@ takes effect halfway through a run: no need to reload the config or rebuild the
 machine.
 """
 
+import bag
 from events import CancelRequest, Event, NextRequest
 
 DEFAULT_ENTER = "default_enter"
@@ -86,6 +87,15 @@ def start_progress(state):
     CancelRequest.take()  # a cancel from the previous lap has nothing to abort
 
     if not NextRequest.take():
+        return Event.NONE
+
+    # The lap does not begin while a topic has nobody publishing it. A lap run
+    # like that looks perfectly healthy and produces a bag with holes in it, and
+    # the holes are only found later, by whoever tries to use the data.
+    missing = bag.RECORDER.missing_topics()
+    if missing:
+        print(f"[input   ] not leaving {state.name}, nothing publishes "
+              f"{', '.join(missing)}")
         return Event.NONE
     return Event.NEXT
 
