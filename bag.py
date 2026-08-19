@@ -49,6 +49,7 @@ Cancel has to be able to delete those too.
 import json
 import re
 import shutil
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -86,6 +87,21 @@ MAX_CACHE_BYTES = 20 * 1024 * 1024 * 1024
 # dies of a full disk the bag it was writing is already unusable.
 MIN_FREE_BYTES = 10 * 1024 * 1024 * 1024
 SPACE_CHECK_PERIOD = 5.0  # seconds between disk checks while recording
+
+# Seconds of real recording at the start of a lap, before it is paused to wait
+# for the operator. A transient_local ("latched") topic - /tf_static, and every
+# /robot_description - sends its one and only message the moment we subscribe,
+# and a paused recorder throws it away for good: measured, start_paused=True
+# gives 0 messages on such a topic, start_paused=False gives 1. So the lap starts
+# recording for real, keeps what is latched, and only then goes quiet. Long
+# enough to cover subscriptions to topics that already exist (0.4 s measured),
+# short enough not to fill the disk with the robot standing still.
+LATCH_WINDOW = 3.0
+
+# Depth of the subscription forced onto topics that have no publisher yet. They
+# are the only ones that need a QoS decided in advance - for every other topic
+# rosbag2 copies the QoS from the publisher it can see, which is always right.
+UNPUBLISHED_DEPTH = 50
 
 SERVICE_TIMEOUT = 5.0  # the recorder needs a moment to advertise split_bagfile
 CALL_TIMEOUT = 2.0
@@ -213,6 +229,8 @@ class BagRecorder:
         self._ros = _Ros()
         self._next_space_check = 0.0
         self._space_warned = False
+        self._holding = False    # in the Start state, waiting for the operator
+        self._latch_timer = None
 
     def configure(self, topics, root):
         self.topics = [str(topic).strip() for topic in (topics or [])]
@@ -280,7 +298,8 @@ class BagRecorder:
         options.rmw_serialization_format = SERIALIZATION
         options.topic_polling_interval = POLLING_INTERVAL
         options.include_unpublished_topics = True  # see the module docstring
-        options.start_paused = True  # nothing to record until Start is left
+        options.topic_qos_profile_overrides = self._qos_for_unpublished()
+        options.start_paused = False  # latched topics arrive now, see LATCH_WINDOW
         options.disable_keyboard_controls = True  # the operator's stdin is ours
 
         try:
@@ -298,8 +317,54 @@ class BagRecorder:
         self._space_warned = False
         print(f"[bag     ] lap {name} <- {len(self.topics)} topic(s)")
 
+        self._holding = True
+        self._latch_timer = threading.Timer(LATCH_WINDOW, self._quiet_down)
+        self._latch_timer.daemon = True
+        self._latch_timer.start()
+
         self._ros.bind(node_name)
         return name
+
+    def _quiet_down(self):
+        """Pause once the latched messages are in, if Start is still waiting."""
+        if self._holding and self.recording:
+            self._recorder.pause()
+            print(f"[bag     ] {self._name}: latched topics kept, paused at Start")
+
+    def _qos_for_unpublished(self):
+        """Subscription QoS for the topics nobody is publishing yet.
+
+        With include_unpublished_topics rosbag2 has no publisher to copy a QoS
+        from, so it subscribes with the default - RELIABLE, VOLATILE. Then the
+        real node arrives offering BEST_EFFORT, the two do not match, and rosbag2
+        says so and records nothing:
+
+            A new publisher for subscribed topic /vr_buttons was found offering
+            BEST_EFFORT, but rosbag already subscribed requesting RELIABLE.
+            Messages from this new publisher will not be recorded.
+
+        BEST_EFFORT + VOLATILE is the permissive end of both policies: such a
+        subscription accepts data from RELIABLE and BEST_EFFORT publishers alike,
+        and from VOLATILE and TRANSIENT_LOCAL alike. It is the only choice that
+        cannot lock us out of a publisher we have not met yet.
+
+        Topics that already have a publisher are left alone deliberately - there
+        rosbag2 reads the real QoS off the wire, which beats any guess of ours.
+        """
+        try:
+            from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+        except ImportError:
+            return {}
+
+        profile = QoSProfile(depth=UNPUBLISHED_DEPTH,
+                             reliability=ReliabilityPolicy.BEST_EFFORT,
+                             durability=DurabilityPolicy.VOLATILE)
+        overrides = {_canonical(topic): profile
+                     for topic in self.missing_topics(GRAPH_GRACE)}
+        if overrides:
+            print(f"[bag     ] no publisher yet on {', '.join(overrides)}, "
+                  f"subscribing best-effort so any publisher fits")
+        return overrides
 
     def split_for(self, state, state_id):
         """Cut the file so `state` gets its own chunk.
@@ -333,6 +398,12 @@ class BagRecorder:
             self._recorder.pause()
 
     def resume(self):
+        """Start is over. Whatever the latch timer was going to do, it is too late
+        to be useful and would pause a lap that is now running."""
+        self._holding = False
+        if self._latch_timer is not None:
+            self._latch_timer.cancel()
+            self._latch_timer = None
         if self.recording:
             self._recorder.resume()
 
@@ -349,6 +420,10 @@ class BagRecorder:
 
         recorder, name = self._recorder, self._name
         self._recorder = self._name = None
+        self._holding = False
+        if self._latch_timer is not None:
+            self._latch_timer.cancel()
+            self._latch_timer = None
         try:
             recorder.stop()
         except Exception as error:
