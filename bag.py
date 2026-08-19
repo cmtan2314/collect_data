@@ -42,6 +42,7 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -52,6 +53,7 @@ DATE_FORMAT = "%d%m%Y"
 NAME_PATTERN = re.compile(r"^(?P<date>\d{8})_(?P<id>\d+)(?:_(?P<task>.+))?$")
 FIRST_ID = 1
 UNSAFE_IN_NAME = re.compile(r"[^A-Za-z0-9.-]+")  # a task name is free text in yaml
+SUBSCRIBED_PATTERN = re.compile(r"Subscribed to topic '([^']+)'")  # from the log
 
 RECORD_COMMAND = ("ros2", "bag", "record", "-o")
 LOG_SUFFIX = ".log"  # stderr of one lap, beside its folder
@@ -65,10 +67,17 @@ STOP_TIMEOUT = 5.0     # seconds to let ros2 bag close the file after SIGINT
 SERVICE_TIMEOUT = 5.0  # the recorder needs about a second to offer its services
 CALL_TIMEOUT = 2.0
 ERROR_TAIL = 300       # characters of stderr worth showing
+GRAPH_GRACE = 1.5      # a rclpy node just created knows of nothing yet, see below
 
 
 class BagError(RuntimeError):
     """Recording could not start, or died on its own."""
+
+
+def _canonical(topic):
+    """The graph names topics absolutely, the config is allowed to leave the / out."""
+    topic = str(topic).strip()
+    return topic if topic.startswith("/") else f"/{topic}"
 
 
 def _stop_signals():
@@ -170,6 +179,16 @@ class _Services:
             print(f"[warn    ] {self._target}/{key} timed out")
             return False
         return True
+
+    def graph_topics(self):
+        """Topic names the ROS graph knows right now, None if there is no rclpy.
+
+        Read from the local discovery cache, not a service call, so asking on
+        every state costs nothing worth measuring.
+        """
+        if self._node is None:
+            return None
+        return {name for name, _types in self._node.get_topic_names_and_types()}
 
     def close(self):
         if self._node is not None:
@@ -298,8 +317,11 @@ class BagRecorder:
             print(f"[warn    ] no split for {state}, it shares the previous file")
             index = self._chunks[-1]["chunk"]
 
+        # what the graph looked like at this exact moment, so a lap that came back
+        # half empty can be explained afterwards instead of guessed at
         self._chunks.append({"chunk": index, "state": state, "id": state_id,
-                             "at": datetime.now().astimezone().isoformat()})
+                             "at": datetime.now().astimezone().isoformat(),
+                             "missing": self.missing_topics()})
         self._write_chunk_map()
         print(f"[bag     ] {self._name}: chunk {index} <- {state} (id {state_id})")
 
@@ -337,7 +359,55 @@ class BagRecorder:
                           f"{STOP_TIMEOUT}s, escalating")
 
         print(f"[bag     ] stopped {name}, {len(self._chunks)} chunk(s)")
+        never = self.never_subscribed()
+        if never:
+            print(f"[warn    ] {name}: never recorded {', '.join(never)}, "
+                  f"the topic never appeared or its QoS did not match")
         self._name_chunks_after_states(name)
+
+    def missing_topics(self, grace=0.0):
+        """Configured topics that nobody is publishing at this moment.
+
+        `grace` is for the one call right after the node is created: discovery is
+        asynchronous and a fresh node knows of nothing for a few hundred
+        milliseconds, so asking straight away reports every topic as missing.
+        Waiting only happens while something IS missing, and the answer is
+        returned the moment the list comes back empty.
+
+        `ros2 bag record` says nothing about a topic that does not exist: it keeps
+        polling for it, records nothing, and still exits cleanly leaving a valid
+        empty bag. A typo in the config would otherwise surface days later, when
+        somebody opens the bag looking for data that was never there.
+        """
+        if not self.enabled:
+            return []
+
+        deadline = time.monotonic() + grace
+        while True:
+            present = self._services.graph_topics()
+            if present is None:
+                return []  # no rclpy, no way to know, better silent than crying wolf
+            missing = [topic for topic in self.topics
+                       if _canonical(topic) not in present]
+            if not missing or time.monotonic() >= deadline:
+                return missing
+            time.sleep(0.1)
+
+    def never_subscribed(self):
+        """Topics the recorder itself never said it subscribed to, over the lap.
+
+        Catches what missing_topics() cannot: a topic that does exist but whose
+        QoS the recorder cannot match. There is no error for that either, the
+        subscription is simply never made and no message ever arrives.
+        """
+        if self._log_path is None:
+            return []
+        try:
+            log = self._log_path.read_text(errors="replace")
+        except OSError:
+            return []
+        seen = set(SUBSCRIBED_PATTERN.findall(log))
+        return [topic for topic in self.topics if _canonical(topic) not in seen]
 
     def trouble(self):
         """Error text if the recorder died by itself, None while all is well.
