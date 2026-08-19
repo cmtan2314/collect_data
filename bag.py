@@ -98,10 +98,8 @@ TOPIC_CHECK_PERIOD = 1.0  # seconds between graph checks while waiting at Start
 # short enough not to fill the disk with the robot standing still.
 LATCH_WINDOW = 3.0
 
-# Depth of the subscription forced onto topics that have no publisher yet. They
-# are the only ones that need a QoS decided in advance - for every other topic
-# rosbag2 copies the QoS from the publisher it can see, which is always right.
-UNPUBLISHED_DEPTH = 50
+# Queue depth of the subscriptions rosbag2 makes for us, see _qos_overrides().
+SUBSCRIPTION_DEPTH = 50
 
 SERVICE_TIMEOUT = 5.0  # the recorder needs a moment to advertise split_bagfile
 CALL_TIMEOUT = 2.0
@@ -192,6 +190,29 @@ class _Ros:
             print(f"[warn    ] {self._target}/split_bagfile timed out")
             return False
         return True
+
+    def latched_topics(self, topics):
+        """Of `topics`, the ones whose publishers offer TRANSIENT_LOCAL.
+
+        These are the ones a QoS override must not touch. A latched publisher
+        hands its one and only message to subscriptions that ask for
+        TRANSIENT_LOCAL, and a VOLATILE subscription gets nothing at all - which
+        is how /tf_static ends up empty in a bag that looks otherwise fine.
+        """
+        if self._node is None:
+            return set()
+
+        from rclpy.qos import DurabilityPolicy
+        latched = set()
+        for topic in topics:
+            try:
+                infos = self._node.get_publishers_info_by_topic(topic)
+            except Exception:
+                continue  # topic not in the graph yet, nothing to read
+            if any(info.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
+                   for info in infos):
+                latched.add(topic)
+        return latched
 
     def graph_topics(self):
         """Topics with at least one PUBLISHER right now, None if there is no rclpy.
@@ -299,7 +320,7 @@ class BagRecorder:
         options.rmw_serialization_format = SERIALIZATION
         options.topic_polling_interval = POLLING_INTERVAL
         options.include_unpublished_topics = True  # see the module docstring
-        options.topic_qos_profile_overrides = self._qos_for_unpublished()
+        options.topic_qos_profile_overrides = self._qos_overrides()
         options.start_paused = False  # latched topics arrive now, see LATCH_WINDOW
         options.disable_keyboard_controls = True  # the operator's stdin is ours
 
@@ -334,39 +355,49 @@ class BagRecorder:
             self._recorder.pause()
             print(f"[bag     ] {self._name}: latched topics kept, paused at Start")
 
-    def _qos_for_unpublished(self):
-        """Subscription QoS for the topics nobody is publishing yet.
+    def _qos_overrides(self):
+        """Subscribe BEST_EFFORT to everything, except what is latched.
 
-        With include_unpublished_topics rosbag2 has no publisher to copy a QoS
-        from, so it subscribes with the default - RELIABLE, VOLATILE. Then the
-        real node arrives offering BEST_EFFORT, the two do not match, and rosbag2
-        says so and records nothing:
+        A subscription only receives from a publisher whose offer is at least as
+        strong as the request, so BEST_EFFORT + VOLATILE is the end of both
+        policies that accepts every publisher there is - reliable or not, alive
+        now or arriving in an hour. Left to itself rosbag2 copies the QoS of
+        whichever publisher happens to exist when it subscribes, and then any
+        later publisher that offers less is locked out for good:
 
             A new publisher for subscribed topic /vr_buttons was found offering
             BEST_EFFORT, but rosbag already subscribed requesting RELIABLE.
             Messages from this new publisher will not be recorded.
 
-        BEST_EFFORT + VOLATILE is the permissive end of both policies: such a
-        subscription accepts data from RELIABLE and BEST_EFFORT publishers alike,
-        and from VOLATILE and TRANSIENT_LOCAL alike. It is the only choice that
-        cannot lock us out of a publisher we have not met yet.
+        The price is that a RELIABLE publisher no longer retransmits for us: what
+        is dropped under load is dropped. That is the right trade for recording -
+        a hole in one topic beats a topic that was never recorded at all.
 
-        Topics that already have a publisher are left alone deliberately - there
-        rosbag2 reads the real QoS off the wire, which beats any guess of ours.
+        Latched topics are the exception and must keep their real QoS. A
+        TRANSIENT_LOCAL publisher only hands its stored message to a
+        TRANSIENT_LOCAL subscription, so forcing VOLATILE on /tf_static would
+        empty it - the very bug this file fixed with LATCH_WINDOW.
         """
         try:
             from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
         except ImportError:
             return {}
 
-        profile = QoSProfile(depth=UNPUBLISHED_DEPTH,
+        # A node created moments ago knows of nothing, and asking it which
+        # publishers offer what would answer "none" for every topic - which would
+        # then override the latched ones too. This waits for discovery, and comes
+        # back the instant every topic has been seen.
+        self.missing_topics(GRAPH_GRACE)
+
+        wanted = [_canonical(topic) for topic in self.topics]
+        latched = self._ros.latched_topics(wanted)
+        profile = QoSProfile(depth=SUBSCRIPTION_DEPTH,
                              reliability=ReliabilityPolicy.BEST_EFFORT,
                              durability=DurabilityPolicy.VOLATILE)
-        overrides = {_canonical(topic): profile
-                     for topic in self.missing_topics(GRAPH_GRACE)}
-        if overrides:
-            print(f"[bag     ] no publisher yet on {', '.join(overrides)}, "
-                  f"subscribing best-effort so any publisher fits")
+        overrides = {topic: profile for topic in wanted if topic not in latched}
+        if latched:
+            print(f"[bag     ] latched, QoS left as offered: {', '.join(sorted(latched))}")
+        print(f"[bag     ] {len(overrides)} topic(s) subscribed best-effort")
         return overrides
 
     def split_for(self, state, state_id):
