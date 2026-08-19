@@ -294,19 +294,6 @@ class ConfiguredSMBase(StateMachine):
             bag.RECORDER.resume()  # the waiting is over, start writing for real
         context.exit()
 
-    @staticmethod
-    def _missing_topics(grace=0.0):
-        """Warning text for topics nobody publishes, None when they are all there.
-
-        Worth saying on every state rather than once: a topic that comes up late
-        is normal, a topic still absent while the robot works is data being lost
-        right now, and the operator is the only one who can do anything about it.
-        """
-        missing = bag.RECORDER.missing_topics(grace)
-        if not missing:
-            return None
-        return f"nothing publishes {', '.join(missing)}, not being recorded"
-
     def _bag_on_enter(self, context):
         """Drive the recorder off the chain. Returns error text, None if fine.
 
@@ -326,8 +313,7 @@ class ConfiguredSMBase(StateMachine):
                     print(f"[warn    ] {error}")
                     bag.RECORDER.last_error = str(error)
                     return str(error)  # red on Start, nothing to cancel yet
-                # first call of the lap: the graph node is new, let it look around
-                return self._missing_topics(bag.GRAPH_GRACE)
+
             case _ if name == CANCEL_STATE:
                 bag.RECORDER.stop_lap()
                 bag.RECORDER.discard()  # the lap is void, so is everything it wrote
@@ -339,7 +325,6 @@ class ConfiguredSMBase(StateMachine):
                     # than let a whole lap run and quietly record nothing
                     return bag.RECORDER.last_error or "not recording"
                 bag.RECORDER.split_for(name, context.id)
-                return self._missing_topics()
         return None
 
     def tick(self):
